@@ -1,0 +1,53 @@
+name: Deploy HelpScout Saved Replies Lambda (Prod)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - prod
+    paths:
+      - index.js
+      - utils/loggedHttp.js
+      - utils/reportExceptions.js
+      - package.json
+      - package-lock.json
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy Standalone Lambda
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Build standalone package
+        run: |
+          rm -rf build
+          mkdir -p build/utils
+          cp index.js build/index.js
+          cp utils/loggedHttp.js build/utils/loggedHttp.js
+          cp utils/reportExceptions.js build/utils/reportExceptions.js
+          cp package.json build/package.json
+          cp package-lock.json build/package-lock.json
+          cd build
+          npm ci --omit=dev
+          zip -r function.zip . -x "*.git*" -x "*.zip"
+
+      - name: Deploy to Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ secrets.HELPSCOUT_SAVED_REPLIES_LAMBDA_NAME }} \
+            --zip-file fileb://build/function.zip \
+            --region ${{ secrets.AWS_REGION }}
