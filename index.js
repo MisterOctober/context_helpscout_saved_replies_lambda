@@ -30,7 +30,7 @@ function parseSavedRepliesListResponse(response) {
 		nextUrl: typeof nextUrl === "string" ? nextUrl : null
 	};
 }
-//
+// //
 async function fetchSavedRepliesList(initialUrl, helpscoutToken, httpClient) {
 	const headers = {
 		Authorization: `Bearer ${helpscoutToken}`,
