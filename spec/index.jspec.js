@@ -266,4 +266,56 @@ describe('helpscoutSavedRepliesStandalone handler', () => {
     expect(mockReportExceptions).toHaveBeenCalledTimes(1);
     expect(mockS3.send).not.toHaveBeenCalled();
   });
+
+  it('should rate limit detail fetches to 2 calls per second', async () => {
+    let fakeNow = 0;
+    const sleepCalls = [];
+    const mockSleep = jasmine.createSpy('sleep').and.callFake(async (ms) => {
+      sleepCalls.push(ms);
+      fakeNow += ms;
+    });
+    const now = () => fakeNow;
+
+    const mockLoggedHttp = jasmine.createSpy('loggedHttp').and.callFake(async (url) => {
+      const reqUrl = String(url);
+
+      if (reqUrl.includes('helpscout.net/v2/oauth2/token')) {
+        return { access_token: 'mock-token' };
+      }
+
+      if (/\/mailboxes\/[^/]+\/saved-replies$/.test(reqUrl)) {
+        return [{ id: 1 }, { id: 2 }, { id: 3 }];
+      }
+
+      if (reqUrl.includes('/mailboxes/mailbox-123/saved-replies/1')) {
+        return { id: 1, name: 'Reply 1' };
+      }
+
+      if (reqUrl.includes('/mailboxes/mailbox-123/saved-replies/2')) {
+        return { id: 2, name: 'Reply 2' };
+      }
+
+      if (reqUrl.includes('/mailboxes/mailbox-123/saved-replies/3')) {
+        return { id: 3, name: 'Reply 3' };
+      }
+
+      throw new Error(`unexpected URL ${reqUrl}`);
+    });
+
+    const mockS3 = {
+      send: jasmine.createSpy('send').and.resolveTo({})
+    };
+
+    const result = await handler({}, {}, {
+      loggedHttp: mockLoggedHttp,
+      s3: mockS3,
+      sleep: mockSleep,
+      now,
+      savedRepliesRateLimitMs: 500
+    });
+
+    expect(result.statusCode).toBe(200);
+    expect(mockSleep).toHaveBeenCalledTimes(2);
+    expect(sleepCalls).toEqual([500, 500]);
+  });
 });

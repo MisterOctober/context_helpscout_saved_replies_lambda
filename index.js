@@ -3,6 +3,7 @@ import defaultLoggedHttp from "./utils/loggedHttp.js";
 import defaultReportExceptions from "./utils/reportExceptions.js";
 
 const defaultS3 = new S3Client();
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function stepStart(label) {
 	const t0 = Date.now();
@@ -30,7 +31,6 @@ function parseSavedRepliesListResponse(response) {
 		nextUrl: typeof nextUrl === "string" ? nextUrl : null
 	};
 }
-// // // 
 async function fetchSavedRepliesList(initialUrl, helpscoutToken, httpClient) {
 	const headers = {
 		Authorization: `Bearer ${helpscoutToken}`,
@@ -66,59 +66,66 @@ async function fetchSavedRepliesList(initialUrl, helpscoutToken, httpClient) {
 	return allReplies;
 }
 
-async function fetchAllSavedReplies(savedRepliesList, helpscoutToken, httpClient) {
+async function fetchAllSavedReplies(savedRepliesList, helpscoutToken, httpClient, timing = {}) {
 	const helpscoutMailboxId = process.env.HELPSCOUT_MAILBOX_ID;
 	if (!helpscoutToken || !savedRepliesList.length) {
 		return [];
 	}
+	const rateLimitMs = timing.rateLimitMs ?? 500;
+	const sleep = timing.sleep ?? defaultSleep;
+	const now = timing.now ?? Date.now;
 	const options = {
 		slackChannel: null,
 		functionName: "savedRepliesDetails"
 	};
 
 	const results = [];
-	const concurrencyLimit = 10;
+	let nextAllowedRequestAt = 0;
 
-	for (let i = 0; i < savedRepliesList.length; i += concurrencyLimit) {
-		const batch = savedRepliesList.slice(i, i + concurrencyLimit);
-		const batchPromises = batch.map(async (reply) => {
-				const candidateUrls = [
-					(helpscoutMailboxId && reply?.id)
-						? `https://api.helpscout.net/v2/mailboxes/${helpscoutMailboxId}/saved-replies/${reply.id}`
-						: null,
-					reply?._links?.self?.href,
-					reply?.id ? `https://api.helpscout.net/v2/saved-replies/${reply.id}` : null
-				].filter(Boolean);
+	const rateLimitedHttpRequest = async (url, config) => {
+		const currentTime = now();
+		if (currentTime < nextAllowedRequestAt) {
+			await sleep(nextAllowedRequestAt - currentTime);
+		}
+		nextAllowedRequestAt = Math.max(nextAllowedRequestAt, now()) + rateLimitMs;
+		return httpClient(url, config, options);
+	};
 
-				if (!candidateUrls.length) {
-					throw new Error("No valid saved reply detail URL could be constructed");
-				}
+	for (const reply of savedRepliesList) {
+		const candidateUrls = [
+			(helpscoutMailboxId && reply?.id)
+				? `https://api.helpscout.net/v2/mailboxes/${helpscoutMailboxId}/saved-replies/${reply.id}`
+				: null,
+			reply?._links?.self?.href,
+			reply?.id ? `https://api.helpscout.net/v2/saved-replies/${reply.id}` : null
+		].filter(Boolean);
 
-				let lastError;
-				for (const url of [...new Set(candidateUrls)]) {
-					try {
-						return await httpClient(url, {
-							headers: {
-								Authorization: `Bearer ${helpscoutToken}`,
-								"Content-Type": "application/json; charset=UTF-8"
-							}
-						}, options);
-					} catch (err) {
-						lastError = err;
-						if (err?.response?.status !== 404) {
-							throw err;
-						}
+		if (!candidateUrls.length) {
+			throw new Error("No valid saved reply detail URL could be constructed");
+		}
+
+		let lastError;
+		for (const url of [...new Set(candidateUrls)]) {
+			try {
+				const detail = await rateLimitedHttpRequest(url, {
+					headers: {
+						Authorization: `Bearer ${helpscoutToken}`,
+						"Content-Type": "application/json; charset=UTF-8"
 					}
+				});
+				results.push(detail);
+				lastError = null;
+				break;
+			} catch (err) {
+				lastError = err;
+				if (err?.response?.status !== 404) {
+					throw err;
 				}
+			}
+		}
 
-				throw lastError;
-		});
-
-		const batchResults = await Promise.all(batchPromises);
-		results.push(...batchResults);
-
-		if (i + concurrencyLimit < savedRepliesList.length) {
-			await new Promise((resolve) => setTimeout(resolve, 100));
+		if (lastError) {
+			throw lastError;
 		}
 	}
 
@@ -158,6 +165,9 @@ export const handler = async (event, context, deps = {}) => {
 	const loggedHttp = deps.loggedHttp ?? defaultLoggedHttp;
 	const s3 = deps.s3 ?? defaultS3;
 	const reportExceptions = deps.reportExceptions ?? defaultReportExceptions;
+	const sleep = deps.sleep ?? defaultSleep;
+	const now = deps.now ?? Date.now;
+	const savedRepliesRateLimitMs = deps.savedRepliesRateLimitMs ?? 500;
 
 	console.log("Help Scout standalone lambda triggered:", JSON.stringify(event));
 
@@ -179,7 +189,11 @@ export const handler = async (event, context, deps = {}) => {
 		let savedReplies = [];
 		if (savedRepliesList.length > 0) {
 			const log = stepStart("savedRepliesDetails");
-			savedReplies = await fetchAllSavedReplies(savedRepliesList, helpscoutToken, loggedHttp);
+			savedReplies = await fetchAllSavedReplies(savedRepliesList, helpscoutToken, loggedHttp, {
+				rateLimitMs: savedRepliesRateLimitMs,
+				sleep,
+				now
+			});
 			log("fetched", savedReplies);
 		}
 
