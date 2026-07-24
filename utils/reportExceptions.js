@@ -38,7 +38,8 @@ function redactSensitive(value, seen = new WeakSet()) {
 }
 
 /**
- * Uploads an error payload as a file to Slack and posts it to a channel.
+ * Delivers an error payload to Slack: the preferred path uploads it as a file
+ * and posts it to a channel; the fallback posts it inline (no file attached).
  * Tries external upload flow first (getUploadURLExternal + completeUploadExternal),
  * then falls back to chat.postMessage with the payload inlined as a code block
  * (Slack retired files.upload — it now returns `method_deprecated`).
@@ -127,7 +128,7 @@ export async function reportExceptionToSlack({ error, channel, functionName, axi
       console.log('Slack API response:', slackResponse.data);
     }
   } catch (slackErr) {
-    console.error('Failed to send error file to Slack:', slackErr.message);
+    console.error('Failed to deliver exception to Slack:', slackErr.message);
     if (slackErr.response && slackErr.response.data) {
       console.error('Slack API error response:', slackErr.response.data);
     }
