@@ -135,6 +135,34 @@ describe('reportExceptionToSlack delivery mechanics (2026-07-23 fix)', () => {
     expect(postMsgCall.args[1].text).not.toContain('sekrit-value');
   });
 
+  it('falls back to chat.postMessage when completeUploadExternal returns ok:false (X1)', async () => {
+    const warnSpy = spyOn(console, 'warn');
+    postSpy.and.callFake(async (url) => {
+      if (String(url).includes('getUploadURLExternal')) {
+        return { data: { ok: true, upload_url: 'https://upload.example', file_id: 'F123' } };
+      }
+      if (String(url).includes('completeUploadExternal')) {
+        return { data: { ok: false, error: 'channel_not_found' } };
+      }
+      if (String(url).includes('chat.postMessage')) {
+        return { data: { ok: true } };
+      }
+      return { data: {} }; // the raw upload to upload_url
+    });
+
+    await reportExceptionToSlack({ error: new Error('boom'), channel: 'C123', functionName: 'specFn' });
+
+    // The not-ok completion is logged and the report still reaches the channel
+    // via the fallback — never a silent no-post "success".
+    expect(warnSpy).toHaveBeenCalledWith(
+      'files.completeUploadExternal returned not-ok:',
+      jasmine.objectContaining({ error: 'channel_not_found' })
+    );
+    const postMsgCall = postSpy.calls.all().find((c) => String(c.args[0]).includes('chat.postMessage'));
+    expect(postMsgCall).toBeDefined();
+    expect(postMsgCall.args[1].text).toContain('boom');
+  });
+
   it('reportExceptions forwards stage + remaining context keys, hoisting functionName/axiosConfig/channel', async () => {
     postSpy.and.callFake(async (url) => {
       if (String(url).includes('getUploadURLExternal')) {

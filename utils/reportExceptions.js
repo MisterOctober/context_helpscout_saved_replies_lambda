@@ -103,17 +103,24 @@ export async function reportExceptionToSlack({ error, channel, functionName, sta
         const form = new FormData();
         form.append('file', Buffer.from(errorText), { filename: 'error_payload.json', contentType: 'application/json' });
         await axios.post(uploadUrl, form, { headers: { ...form.getHeaders(), Authorization: `Bearer ${token}` } });
-        await axios.post('https://slack.com/api/files.completeUploadExternal', {
+        const completeResp = await axios.post('https://slack.com/api/files.completeUploadExternal', {
           files: [{ id: fileId }],
           channel_id: chan,
           initial_comment: initialComment
         }, { headers: { Authorization: `Bearer ${token}` } });
-        return;
+        // completeUploadExternal also reports failure as HTTP 200 + ok:false
+        // (bad channel_id, expired file_id). Returning without checking would be
+        // a silent no-post "success" — the exact class this util was cured of —
+        // so log and fall through to the chat.postMessage fallback instead
+        // (utils review X1, authorized 2026-07-24).
+        if (completeResp.data?.ok) return;
+        console.warn('files.completeUploadExternal returned not-ok:', completeResp.data);
+      } else {
+        // A not-ok response does NOT throw, so log it explicitly — otherwise the
+        // reason for falling back is invisible (this exact silence hid the
+        // invalid_arguments bug above for months).
+        console.warn('files.getUploadURLExternal returned not-ok:', getUrlResp.data);
       }
-      // A not-ok response does NOT throw, so log it explicitly — otherwise the
-      // reason for falling back is invisible (this exact silence hid the
-      // invalid_arguments bug above for months).
-      console.warn('files.getUploadURLExternal returned not-ok:', getUrlResp.data);
     } catch (e) {
       console.warn('External upload flow failed, falling back to chat.postMessage:', e?.response?.data || e.message);
     }
