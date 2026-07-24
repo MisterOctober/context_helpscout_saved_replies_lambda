@@ -48,8 +48,14 @@ function redactSensitive(value, seen = new WeakSet()) {
  * @param {string} params.channel - Slack channel ID (e.g., 'C019CH6T08Y').
  * @param {string} params.functionName - Name of the function for context.
  * @param {object} params.axiosConfig - The original Axios config for context.
+ * @param {string} [params.stage] - Call-site stage label (e.g. 'resolve_handler') —
+ *   shown in the message comment so reports from different layers of the same
+ *   error are distinguishable at a glance.
+ * @param {object} [params.extraContext] - Remaining context keys from the
+ *   reportExceptions call site (e.g. { alertUrl: 'http://pg/alerts?name=eq.x' }) —
+ *   redacted and serialized into the payload (context-enrichment, 2026-07-24).
  */
-export async function reportExceptionToSlack({ error, channel, functionName, axiosConfig }) {
+export async function reportExceptionToSlack({ error, channel, functionName, stage, axiosConfig, extraContext }) {
   const chan = channel || process.env.SLACK_CHANNEL_ID || 'C019CH6T08Y';
   const token = process.env.THERABOT2_TOKEN || process.env.SLACK_BOT_TOKEN;
   try {
@@ -59,6 +65,8 @@ export async function reportExceptionToSlack({ error, channel, functionName, axi
     const errorText = JSON.stringify({
       message: error?.message,
       stack: error?.stack,
+      stage,
+      context: redactSensitive(extraContext),
       response: error?.response && {
         status: error.response.status,
         data: redactSensitive(error.response.data),
@@ -68,6 +76,7 @@ export async function reportExceptionToSlack({ error, channel, functionName, axi
     }, null, 2);
 
     let initialComment = `*Exception* in function \`${functionName}\``;
+    if (stage) initialComment += `\n*Stage*: \`${stage}\``;
     if (error?.message) initialComment += `\n*Error*: \`${error.message}\``;
     if (axiosConfig?.url) initialComment += `\n*URL*: ${axiosConfig.url}`;
     if (axiosConfig?.method) initialComment += `\n*Method*: ${axiosConfig.method}`;
@@ -141,11 +150,18 @@ export default async function reportExceptions(err, context = {}) {
   try {
     // Only attempt Slack when tokens are present to avoid noisy test logs
     if (process.env.THERABOT2_TOKEN || process.env.SLACK_BOT_TOKEN) {
+      // Context-enrichment (2026-07-24, authorized @MisterOctober): forward the
+      // stage and ALL remaining context keys — previously only functionName/
+      // axiosConfig/channel reached Slack; stage and call-site extras (alertUrl,
+      // pendingUrl, …) were visible in CloudWatch only.
+      const { functionName, stage, axiosConfig, channel, ...extraContext } = context;
       await reportExceptionToSlack({
         error: err,
-        functionName: context.functionName,
-        axiosConfig: context.axiosConfig,
-        channel: context.channel
+        functionName,
+        stage,
+        axiosConfig,
+        channel,
+        extraContext: Object.keys(extraContext).length ? extraContext : undefined
       });
     }
   } catch (slackErr) {

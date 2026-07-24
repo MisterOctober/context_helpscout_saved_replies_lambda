@@ -17,7 +17,7 @@
  * saved/restored around each spec.
  */
 import axios from 'axios';
-import { reportExceptionToSlack } from '../utils/reportExceptions.js';
+import reportExceptions, { reportExceptionToSlack } from '../utils/reportExceptions.js';
 
 describe('reportExceptionToSlack delivery mechanics (2026-07-23 fix)', () => {
   let postSpy;
@@ -105,5 +105,58 @@ describe('reportExceptionToSlack delivery mechanics (2026-07-23 fix)', () => {
     expect(postMsgCall.args[1].text).toContain('[truncated — full payload in CloudWatch]');
     // 8000-char payload cap + comment/fence overhead stays well under Slack limits.
     expect(postMsgCall.args[1].text.length).toBeLessThan(9500);
+  });
+
+  it('carries stage and redacted extra context into the Slack report (2026-07-24 enrichment)', async () => {
+    postSpy.and.callFake(async (url) => {
+      if (String(url).includes('getUploadURLExternal')) {
+        return { data: { ok: false, error: 'invalid_arguments' } };
+      }
+      return { data: { ok: true } };
+    });
+
+    await reportExceptionToSlack({
+      error: new Error('boom'),
+      channel: 'C123',
+      functionName: 'specFn',
+      stage: 'resolve_handler',
+      extraContext: { alertUrl: 'http://pg/alerts?name=eq.x', api_key: 'sekrit-value' }
+    });
+
+    const postMsgCall = postSpy.calls.all().find((c) => String(c.args[0]).includes('chat.postMessage'));
+    expect(postMsgCall).toBeDefined();
+    // Stage is surfaced in the comment line, so same-error reports from
+    // different layers are distinguishable at a glance.
+    expect(postMsgCall.args[1].text).toContain('*Stage*: `resolve_handler`');
+    // Extra context reaches the payload…
+    expect(postMsgCall.args[1].text).toContain('http://pg/alerts?name=eq.x');
+    // …with the redaction pass applied (sensitive keys masked).
+    expect(postMsgCall.args[1].text).toContain('[REDACTED]');
+    expect(postMsgCall.args[1].text).not.toContain('sekrit-value');
+  });
+
+  it('reportExceptions forwards stage + remaining context keys, hoisting functionName/axiosConfig/channel', async () => {
+    postSpy.and.callFake(async (url) => {
+      if (String(url).includes('getUploadURLExternal')) {
+        return { data: { ok: false, error: 'invalid_arguments' } };
+      }
+      return { data: { ok: true } };
+    });
+
+    await reportExceptions(new Error('boom'), {
+      functionName: 'specFn',
+      stage: 'top_level',
+      channel: 'C123',
+      alertName: 'foo_alert'
+    });
+
+    const postMsgCall = postSpy.calls.all().find((c) => String(c.args[0]).includes('chat.postMessage'));
+    expect(postMsgCall).toBeDefined();
+    expect(postMsgCall.args[1].channel).toBe('C123');
+    expect(postMsgCall.args[1].text).toContain('*Stage*: `top_level`');
+    // The leftover context key rides along as extraContext…
+    expect(postMsgCall.args[1].text).toContain('foo_alert');
+    // …but the hoisted keys are not duplicated into it.
+    expect(postMsgCall.args[1].text).not.toContain('"functionName"');
   });
 });
