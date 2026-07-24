@@ -28,6 +28,15 @@ async function loggedHttp(urlOrConfig, axiosConfigOrOptions = {}, maybeOptions) 
     functionName = 'loggedHttp'
   } = options;
 
+  // Per-attempt request timeout (parity fix, 2026-07-23 — authorized @MisterOctober):
+  // the Node-RED logged_http subflow's http-request node enforced a default request
+  // timeout, which the original port omitted — leaving every call unbounded (axios
+  // default 0). A hung endpoint therefore consumed the entire Lambda budget with ZERO
+  // retries. Bounding each attempt converts hangs into retryable failures (worst case
+  // per call: 3 attempts x 30s + 2 x 30s sleeps = 150s). Default-when-absent: a
+  // call-site may override by setting `timeout` in axiosConfig.
+  axiosConfig.timeout = axiosConfig.timeout ?? 30000;
+
   let lastError;
   for (let attempt = 1; attempt <= maxTries; attempt++) {
     try {

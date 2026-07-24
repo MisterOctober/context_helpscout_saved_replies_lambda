@@ -40,7 +40,8 @@ function redactSensitive(value, seen = new WeakSet()) {
 /**
  * Uploads an error payload as a file to Slack and posts it to a channel.
  * Tries external upload flow first (getUploadURLExternal + completeUploadExternal),
- * falls back to files.upload for compatibility.
+ * then falls back to chat.postMessage with the payload inlined as a code block
+ * (Slack retired files.upload — it now returns `method_deprecated`).
  * @param {object} params
  * @param {object} params.error - The error object to report.
  * @param {string} params.channel - Slack channel ID (e.g., 'C019CH6T08Y').
@@ -70,13 +71,21 @@ export async function reportExceptionToSlack({ error, channel, functionName, axi
     if (axiosConfig?.url) initialComment += `\n*URL*: ${axiosConfig.url}`;
     if (axiosConfig?.method) initialComment += `\n*Method*: ${axiosConfig.method}`;
 
-    // 1) Try modern external upload API
+    // 1) Try modern external upload API.
+    // NOTE (bug fix 2026-07-23, authorized @MisterOctober): files.getUploadURLExternal
+    // does NOT accept application/json — arguments must be form-encoded, or Slack
+    // replies { ok: false, error: 'invalid_arguments' }. The original JSON-body call
+    // therefore failed silently on every invocation, leaving exception reporting dark.
     try {
-      const getUrlResp = await axios.post('https://slack.com/api/files.getUploadURLExternal', {
-        filename: 'error_payload.json',
-        length: Buffer.byteLength(errorText),
-        snippet_type: 'javascript'
-      }, { headers: { Authorization: `Bearer ${token}` } });
+      const getUrlResp = await axios.post(
+        'https://slack.com/api/files.getUploadURLExternal',
+        new URLSearchParams({
+          filename: 'error_payload.json',
+          length: String(Buffer.byteLength(errorText)),
+          snippet_type: 'javascript'
+        }).toString(),
+        { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
 
       if (getUrlResp.data?.ok && getUrlResp.data?.upload_url && getUrlResp.data?.file_id) {
         const uploadUrl = getUrlResp.data.upload_url;
@@ -91,27 +100,32 @@ export async function reportExceptionToSlack({ error, channel, functionName, axi
         }, { headers: { Authorization: `Bearer ${token}` } });
         return;
       }
+      // A not-ok response does NOT throw, so log it explicitly — otherwise the
+      // reason for falling back is invisible (this exact silence hid the
+      // invalid_arguments bug above for months).
+      console.warn('files.getUploadURLExternal returned not-ok:', getUrlResp.data);
     } catch (e) {
-      console.warn('External upload flow failed, falling back to files.upload:', e?.response?.data || e.message);
+      console.warn('External upload flow failed, falling back to chat.postMessage:', e?.response?.data || e.message);
     }
 
-    // 2) Fallback to files.upload
-    const form = new FormData();
-    form.append('channels', chan);
-    form.append('filename', 'error_payload.json');
-    form.append('filetype', 'javascript');
-    form.append('initial_comment', initialComment);
-    form.append('title', `Error in ${functionName}`);
-    form.append('file', Buffer.from(errorText), {
-      filename: 'error_payload.json',
-      contentType: 'application/json'
-    });
+    // 2) Fallback: Slack retired files.upload (it now returns `method_deprecated`),
+    // so degrade to chat.postMessage with the payload inlined as a code block.
+    // Truncated to stay comfortably under Slack's per-message text limits; the
+    // full payload is always in the CloudWatch log (console.error at the call site).
+    const MAX_INLINE_PAYLOAD = 8000;
+    const inlinePayload = errorText.length > MAX_INLINE_PAYLOAD
+      ? `${errorText.slice(0, MAX_INLINE_PAYLOAD)}\n… [truncated — full payload in CloudWatch]`
+      : errorText;
+    const slackResponse = await axios.post('https://slack.com/api/chat.postMessage', {
+      channel: chan,
+      text: `${initialComment}\n\`\`\`${inlinePayload}\`\`\``
+    }, { headers: { Authorization: `Bearer ${token}` } });
 
-    const slackResponse = await axios.post('https://slack.com/api/files.upload', form, {
-      headers: { ...form.getHeaders(), Authorization: `Bearer ${token}` }
-    });
-
-    console.log('Slack API response:', slackResponse.data);
+    if (!slackResponse.data?.ok) {
+      console.error('chat.postMessage fallback failed:', slackResponse.data);
+    } else {
+      console.log('Slack API response:', slackResponse.data);
+    }
   } catch (slackErr) {
     console.error('Failed to send error file to Slack:', slackErr.message);
     if (slackErr.response && slackErr.response.data) {
