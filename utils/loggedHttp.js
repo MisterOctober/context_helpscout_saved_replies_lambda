@@ -29,6 +29,9 @@ const DEFAULT_SLOW_MS = 2000;
 function timingTarget(url) {
   try {
     const parsed = new URL(String(url));
+    // Only http(s) has a host + path worth rendering. Opaque schemes (data:, mailto:,
+    // javascript:) expose their PAYLOAD as pathname — never render it (Copilot, round 7).
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '<non-http-url>';
     // hooks.slack.com, hooks.zapier.com, webhook.botpress.cloud, …: the path is the credential.
     const isCapabilityHost = /(^|\.)(web)?hooks?\./i.test(parsed.host);
     return `${parsed.protocol}//${parsed.host}${isCapabilityHost ? '/<redacted>' : parsed.pathname}`;
@@ -89,8 +92,9 @@ function slowThresholdMs() {
  * @param {object} entry - e.g. { functionName: 'tomoCheck', method: 'patch',
  *   url: 'https://api.airtable.com/v0/appX/tomo_responses/rec1', attempt: 1,
  *   maxTries: 3, durationMs: 412, response: { status: 200 } }
- *   or { …, durationMs: 31, err: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) }
+ *   or { …, durationMs: 31, err: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), failed: true }
  *   or { …, durationMs: 90, response: { status: 503 }, failed: true }
+ *   `failed` is the ONLY failure signal; `err` may legitimately be undefined/null/0/'' on a failure.
  */
 function logTiming({ functionName, method, url, attempt, maxTries, durationMs, response, err, failed }) {
   // NEVER-THROW CONTRACT: this runs inside the retry loop's try/catch. A throw
@@ -110,7 +114,7 @@ function logTiming({ functionName, method, url, attempt, maxTries, durationMs, r
     const rawStatus = response ? safeRead(response, 'status') : (rawResponse && rawResponse !== UNREADABLE ? safeRead(rawResponse, 'status') : undefined);
     const unreadable = [rawCode, rawMessage, rawResponse, rawStatus].includes(UNREADABLE); // message is read only to detect hostile getters — never logged
     const status = Number.isFinite(rawStatus) ? rawStatus : undefined;
-    const isFailure = Boolean(err) || Boolean(failed);
+    const isFailure = Boolean(failed); // never inferred from `err` — a falsy rejection reason is still a failure
     let errorText;
     if (isFailure) {
       errorText = unreadable
@@ -187,7 +191,9 @@ async function loggedHttp(urlOrConfig, axiosConfigOrOptions = {}, maybeOptions) 
       }
     } catch (err) {
       lastError = err;
-      logTiming({ ...timing, err, durationMs: Date.now() - startedAt });
+      // `failed: true` is explicit: a promise may reject with a FALSY reason and the
+      // attempt is still a failure (Copilot, round 7).
+      logTiming({ ...timing, err, failed: true, durationMs: Date.now() - startedAt });
     }
     if (attempt < maxTries) {
       await new Promise(res => setTimeout(res, retryInterval));

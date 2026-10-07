@@ -61,6 +61,19 @@ describe('loggedHttp per-call timing log', () => {
     expect(_timing.timingTarget('https://hooks.zapier.com/hooks/catch/1/abc/')).toBe('https://hooks.zapier.com/<redacted>');
     expect(_timing.timingTarget('https://webhook.botpress.cloud/secret-id')).toBe('https://webhook.botpress.cloud/<redacted>');
     expect(_timing.timingTarget('not a url')).toBe('<unparseable-url>');
+    expect(_timing.timingTarget('data:text/plain,API_KEY_SUPERSECRET')).toBe('<non-http-url>'); // opaque schemes never render their payload
+    expect(_timing.timingTarget('mailto:someone@example.test?subject=SUPERSECRET')).toBe('<non-http-url>');
+  });
+
+  it('a FALSY rejection reason is still a failed attempt: warn line with error "request failed"', () => {
+    // Through real axios a falsy adapter rejection is normalised, so pin logTiming directly.
+    for (const reason of [undefined, null, 0, '', false]) {
+      warnSpy.calls.reset(); logSpy.calls.reset();
+      _timing.logTiming({ functionName: 'spec', method: 'get', url: 'https://example.test/x', attempt: 1, maxTries: 1, durationMs: 5, err: reason, failed: true });
+      expect(timingLines(logSpy).length).withContext(String(reason)).toBe(0);
+      expect(timingLines(warnSpy).length).withContext(String(reason)).toBe(1);
+      expect(parseLine(timingLines(warnSpy)[0]).error).withContext(String(reason)).toBe('request failed');
+    }
   });
 
   it('marks a call at/over the slow threshold "SLOW" and routes it to console.warn (default 2000 ms)', async () => {
@@ -176,7 +189,7 @@ describe('loggedHttp per-call timing log', () => {
     await expectAsync(loggedHttp({ method: 'get', url: 'https://example.test/x', adapter }, { functionName: 'spec', maxTries: 2, retryInterval: 0, slackChannel: null })).toBeRejected();
     expect(calls).toBe(2);
     warnSpy.calls.reset();
-    expect(() => _timing.logTiming({ functionName: 'spec', method: 'get', url: 'https://example.test/x', attempt: 1, maxTries: 1, durationMs: 1, err: evil })).not.toThrow();
+    expect(() => _timing.logTiming({ functionName: 'spec', method: 'get', url: 'https://example.test/x', attempt: 1, maxTries: 1, durationMs: 1, err: evil, failed: true })).not.toThrow();
     expect(timingLines(warnSpy).length).toBe(1);
     expect(parseLine(timingLines(warnSpy)[0]).error).toBe('<error details unreadable>');
   });
