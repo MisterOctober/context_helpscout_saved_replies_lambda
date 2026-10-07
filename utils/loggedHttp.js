@@ -25,9 +25,6 @@ const { reportExceptionToSlack, redactUrl } = reportExceptionsModule;
 // there would turn a 2xx into a retried (duplicated) write or replace the real
 // network error. Telemetry must not alter the call it observes.
 const DEFAULT_SLOW_MS = 2000;
-/** A bare error code: `ECONNRESET`, `EAI_AGAIN`, `ERR_BAD_RESPONSE`, `HTTP 503`. */
-const BARE_ERROR_CODE_RE = /^(?:[A-Z][A-Z0-9_]{2,}|HTTP \d{3})$/;
-
 /**
  * Secret-safe rendering of a request URL for the timing line.
  * @param {string} url - e.g. 'https://x.api-us1.com/admin/api.php?api_key=SECRET&api_action=contact_list'
@@ -37,6 +34,7 @@ const BARE_ERROR_CODE_RE = /^(?:[A-Z][A-Z0-9_]{2,}|HTTP \d{3})$/;
 function timingTarget(url) {
   try {
     const parsed = new URL(String(url));
+    // hooks.slack.com, hooks.zapier.com, webhook.botpress.cloud, …: the path is the credential.
     const isCapabilityHost = /(^|\.)(web)?hooks?\./i.test(parsed.host);
     return `${parsed.protocol}//${parsed.host}${isCapabilityHost ? '/<redacted>' : parsed.pathname}`;
   } catch (e) {
@@ -45,43 +43,76 @@ function timingTarget(url) {
 }
 
 /**
- * Any URL embedded in free text, and Bearer/Basic/token credentials (Copilot on the
- * port, 2026-10-07, two rounds). The URL match runs to the next WHITESPACE on
- * purpose: userinfo may legally contain `)` `"` `'` `<` `>`, and a matcher that
- * stopped there left the rest of a password in clear after `<unparseable-url>`.
- * Trailing prose punctuation is therefore swallowed into the token — a harmless
- * over-match (the whole token is either rendered host+path or `<unparseable-url>`).
- * The credential match has NO minimum length: `Basic YTpi` (a:b) is a valid
- * credential. Over-redaction of an innocent "token expired" is accepted.
+ * A bare error code as produced by Node/axios (`ECONNRESET`, `EAI_AGAIN`,
+ * `ERR_BAD_RESPONSE`) or by us (`HTTP 503`). Used ONLY to validate a value whose
+ * provenance is already known to be a code (err.code / our own `HTTP <status>`) —
+ * never to classify free text (an uppercase secret would pass a shape test).
  */
-const URL_IN_TEXT_RE = /https?:\/\/\S+/gi;
-const AUTH_SCHEME_RE = /\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]+/gi;
+const BARE_ERROR_CODE_RE = /^(?:[A-Z][A-Z0-9_]{2,39}|HTTP \d{3})$/;
 
 /**
- * Scrub what redactUrl does NOT cover in free text: embedded URLs are reduced to
- * their timing-target form (host + path, capability-host paths redacted, userinfo
- * and query dropped) and auth-scheme credentials are masked.
- *
- * @param {string} text - e.g. 'rejected https://hooks.slack.com/actions/T/B/SECRET with Bearer abcdefghijkl'
- * @returns {string} 'rejected https://hooks.slack.com/<redacted> with Bearer [REDACTED]'
+ * Free-text scrubbing (Copilot on the port, 2026-10-07, three rounds).
+ * - URL tokens run to the next WHITESPACE: userinfo may legally contain `)` `"` `'`
+ *   `<` `>`, and a matcher that stopped there left the rest of a password in clear.
+ * - Inside a token, a JSON/quote/bracket delimiter ends the URL proper; the
+ *   remainder (which may hold ANOTHER URL — compact JSON `{"url":"…","next":"https://hooks…"}`)
+ *   is scrubbed recursively instead of being rendered as the first URL's path.
+ *   If the head is unparseable the WHOLE token is withheld (a quote inside userinfo
+ *   must not leak what follows).
+ * - Auth-scheme credentials have NO minimum length (`Basic YTpi` is valid), and
+ *   colon-delimited credentials (`X-API-Key: …`, `api_key: …`, `password: …`) are
+ *   masked too. Over-redaction of innocent text ("token expired") is accepted.
  */
-function scrubErrorText(text) {
+const URL_IN_TEXT_RE = /https?:\/\/\S+/gi;
+const URL_TOKEN_DELIM_RE = /["'<>{}\[\],;]/;
+const AUTH_SCHEME_RE = /\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]+/gi;
+const COLON_CREDENTIAL_RE = /\b([\w-]*(?:secret|passw(?:or)?d|token|api[_-]?key|authorization|credential|signature|session|cookie|auth)[\w-]*)\s*:\s*(?!Bearer\b|Basic\b|\[REDACTED\])("[^"]*"|'[^']*'|[^\s,;}\]]+)/gi;
+const MAX_SCRUB_DEPTH = 4;
+
+/**
+ * Scrub what redactUrl does NOT cover in free text.
+ *
+ * @param {string} text - e.g. 'rejected {"next":"https://hooks.slack.com/actions/T/B/SECRET"} X-API-Key: SECRET2 with Bearer abc'
+ * @param {number} [depth] - recursion guard for nested URL tokens
+ * @returns {string} 'rejected {"next":"https://hooks.slack.com/<redacted>"} X-API-Key: [REDACTED] with Bearer [REDACTED]'
+ */
+function scrubErrorText(text, depth = 0) {
+  if (depth > MAX_SCRUB_DEPTH) return '<error text truncated: nesting>';
   return String(text)
-    .replace(URL_IN_TEXT_RE, (url) => timingTarget(url))
-    .replace(AUTH_SCHEME_RE, '$1 [REDACTED]');
+    .replace(URL_IN_TEXT_RE, (token) => {
+      const at = token.search(URL_TOKEN_DELIM_RE);
+      if (at === -1) return timingTarget(token);
+      const head = token.slice(0, at);
+      const rendered = timingTarget(head);
+      if (rendered === '<unparseable-url>') return rendered; // whole token withheld
+      // Delimiter inside the QUERY/FRAGMENT → the remainder is query text (possibly a
+      // redacted pair or a nested redirect URL): drop it, never re-emit a query fragment.
+      if (/[?#]/.test(head)) return rendered;
+      return rendered + scrubErrorText(token.slice(at), depth + 1);
+    })
+    .replace(AUTH_SCHEME_RE, '$1 [REDACTED]')
+    .replace(COLON_CREDENTIAL_RE, '$1: [REDACTED]');
 }
 
 /**
- * Secret-safe rendering of the `error` field: redactUrl pairs, then scrubErrorText for
- * embedded URLs and auth-scheme credentials, then truncated — with the redactor;
- * bare codes only (free text withheld) without it.
- * @param {*} error - e.g. 'ECONNRESET' | 'upstream said api_key=SECRET' | 'HTTP 503'
- * @returns {string}
+ * Secret-safe rendering of the `error` field. With the redactor available the text
+ * (code, else message) is scrubbed — redactUrl pairs, then scrubErrorText — and
+ * truncated. Without it (reportExceptions stubbed in require.cache) FAIL CLOSED:
+ * only a provenance-known code is emitted (err.code or our `HTTP <status>`), never
+ * message text, however code-like it looks.
+ *
+ * @param {{code?: string, message?: string}} parts - e.g. { code: 'ECONNRESET' } |
+ *   { message: 'upstream said api_key=SECRET' } | { code: 'HTTP 503' }
+ * @returns {string} 'ECONNRESET' | 'upstream said api_key=[REDACTED]' (redactor present) |
+ *   '<error text withheld: redactor unavailable>' (redactor absent, no code)
  */
-function safeErrorText(error) {
-  const text = String(error);
-  if (typeof redactUrl === 'function') return scrubErrorText(redactUrl(text)).slice(0, 160);
-  return BARE_ERROR_CODE_RE.test(text) ? text : '<error text withheld: redactor unavailable>';
+function safeErrorText(parts) {
+  const { code, message } = (parts && typeof parts === 'object') ? parts : { message: parts };
+  if (typeof redactUrl === 'function') {
+    const text = code || message || 'request failed';
+    return scrubErrorText(redactUrl(String(text))).slice(0, 160);
+  }
+  return (typeof code === 'string' && BARE_ERROR_CODE_RE.test(code)) ? code : '<error text withheld: redactor unavailable>';
 }
 
 /**
@@ -99,13 +130,34 @@ function slowThresholdMs() {
 }
 
 /**
- * Emit the one-line timing record for a single attempt (never throws).
- * @param {object} entry - e.g. { functionName: 'persistOrder', method: 'post',
- *   url: 'http://pg:3000/rpc/upsert_record', attempt: 1, maxTries: 3, status: 200, durationMs: 412 }
+ * Emit the one-line timing record for a single attempt. Takes the RAW `response` /
+ * `err` and derives status/code/message INSIDE the never-throw guard — a rejected
+ * object whose `code`/`message`/`response` getter throws must not escape into the
+ * retry loop (Copilot on the port, round 3).
+ *
+ * @param {object} entry - e.g. { functionName: 'tomoCheck', method: 'patch',
+ *   url: 'https://api.airtable.com/v0/appX/tomo_responses/rec1', attempt: 1,
+ *   maxTries: 3, durationMs: 412, response: { status: 200 } }
+ *   or { …, durationMs: 31, err: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) }
+ *   or { …, durationMs: 90, response: { status: 503 }, failed: true }
  */
-function logTiming({ functionName, method, url, attempt, maxTries, status, durationMs, error }) {
+function logTiming({ functionName, method, url, attempt, maxTries, durationMs, response, err, failed }) {
+  // NEVER-THROW CONTRACT: this runs inside the retry loop's try/catch. A throw
+  // here would turn a 2xx into a retried (duplicated) write, or replace the real
+  // network error and skip the remaining retries + Slack report (adversarial
+  // review 2026-10-07). Telemetry must not alter the call it observes.
   try {
     const slowMs = slowThresholdMs();
+    const status = response ? response.status : (err && err.response ? err.response.status : undefined);
+    const isFailure = Boolean(err) || Boolean(failed);
+    let errorText;
+    if (isFailure) {
+      const code = err
+        ? (typeof err.code === 'string' ? err.code : undefined)
+        : (Number.isFinite(status) ? `HTTP ${status}` : undefined);
+      const message = err ? (typeof err.message === 'string' ? err.message : String(err)) : undefined;
+      errorText = safeErrorText({ code, message });
+    }
     const record = {
       fn: functionName,
       method: String(method || 'get').toUpperCase(),
@@ -113,11 +165,11 @@ function logTiming({ functionName, method, url, attempt, maxTries, status, durat
       attempt: `${attempt}/${maxTries}`,
       status: status ?? null,
       ms: durationMs,
-      ...(error ? { error: safeErrorText(error) } : {})
+      ...(isFailure ? { error: errorText } : {})
     };
     const slow = durationMs >= slowMs;
     const line = `loggedHttp timing${slow ? ' SLOW' : ''} ${JSON.stringify(record)}`;
-    if (slow || error) console.warn(line); else console.log(line);
+    if (slow || isFailure) console.warn(line); else console.log(line);
   } catch (e) {
     // swallow — see contract above
   }
@@ -167,16 +219,16 @@ async function loggedHttp(urlOrConfig, axiosConfigOrOptions = {}, maybeOptions) 
       const response = await axios(axiosConfig);
       const durationMs = Date.now() - startedAt;
       if (response.status >= 200 && response.status < 300) {
-        logTiming({ ...timing, status: response.status, durationMs });
+        logTiming({ ...timing, response, durationMs });
         return response.data;
       } else {
         lastError = new Error(`HTTP ${response.status}: ${JSON.stringify(response.data)}`);
         lastError.response = response;
-        logTiming({ ...timing, status: response.status, durationMs, error: `HTTP ${response.status}` });
+        logTiming({ ...timing, response, durationMs, failed: true });
       }
     } catch (err) {
       lastError = err;
-      logTiming({ ...timing, status: err?.response?.status, durationMs: Date.now() - startedAt, error: err?.code || err?.message || 'request failed' });
+      logTiming({ ...timing, err, durationMs: Date.now() - startedAt });
     }
     if (attempt < maxTries) {
       await new Promise(res => setTimeout(res, retryInterval));
