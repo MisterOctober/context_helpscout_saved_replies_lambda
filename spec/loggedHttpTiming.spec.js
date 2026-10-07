@@ -2,11 +2,13 @@
  * loggedHttp per-call timing log (ported from ts_lambda PR #238, 2026-10-07).
  *
  * Every attempt emits one text-prefixed line:
- *   loggedHttp timing {"fn":…,"method":…,"target":…,"attempt":"1/3","status":200,"ms":412}
- * ESM has no require.cache to swap axios, so these specs drive loggedHttp through
- * axios's own `adapter` hook (a per-request transport override) — no network, no
- * module mocking. Failure cases pass `maxTries: 1` (this copy has no test-env retry
- * suppression, and the default interval is 30 s).
+ *   loggedHttp timing {"fn":…,"method":…,"target":…,"attempt":"1/3","status":200,"ms":412[,"error":"ECONNRESET"]}
+ * The `error` field is a PROVENANCE-KNOWN CODE ONLY (err.code / `HTTP <status>` / `request failed`);
+ * message text is never logged (design ruling after six review rounds).
+ *
+ * ESM has no require.cache to swap axios, so these specs drive loggedHttp through axios's own
+ * `adapter` hook (a per-request transport override) — no network, no module mocking. Failure
+ * cases pass `maxTries: 1` (this copy has no test-env retry suppression; default interval 30 s).
  */
 import loggedHttp, { _timing } from '../utils/loggedHttp.js';
 
@@ -30,6 +32,7 @@ describe('loggedHttp per-call timing log', () => {
   });
 
   const timingLines = (spy) => spy.calls.allArgs().map(a => a[0]).filter(s => typeof s === 'string' && s.startsWith('loggedHttp timing'));
+  const allOutput = () => logSpy.calls.allArgs().flat().join(' ') + ' ' + warnSpy.calls.allArgs().flat().join(' ');
 
   it('logs exactly one "loggedHttp timing" line for a successful call and still returns response.data', async () => {
     const data = await loggedHttp({ method: 'get', url: 'https://api.notion.com/v1/databases/abc/query?x=1', adapter: okAdapter(200, { results: [] }) }, { functionName: 'specFn' });
@@ -48,9 +51,8 @@ describe('loggedHttp per-call timing log', () => {
 
   it('never logs the query string (the ActiveCampaign api_key leak class) and drops URL userinfo', async () => {
     await loggedHttp({ method: 'get', url: 'https://u:apipass@www.theraspecs.api-us1.com/admin/api.php?api_key=SUPERSECRET', adapter: okAdapter() }, { functionName: 'ac' });
-    const all = logSpy.calls.allArgs().flat().join(' ');
-    expect(all).not.toContain('SUPERSECRET');
-    expect(all).not.toContain('apipass');
+    expect(allOutput()).not.toContain('SUPERSECRET');
+    expect(allOutput()).not.toContain('apipass');
     expect(parseLine(timingLines(logSpy)[0]).target).toBe('https://www.theraspecs.api-us1.com/admin/api.php');
   });
 
@@ -80,51 +82,6 @@ describe('loggedHttp per-call timing log', () => {
     expect(parseLine(timingLines(warnSpy)[0]).ms).toBe(3);
   });
 
-  it('logs a failed attempt to console.warn with `error` (redacted) + status; the ORIGINAL error rejects; slackChannel null disarms Slack', async () => {
-    const err = new Error('upstream rejected https://x.test/api.php?api_key=SUPERSECRET');
-    err.response = { status: 503, data: {} };
-    const adapter = async () => { throw err; };
-    await expectAsync(loggedHttp({ method: 'get', url: 'https://x.test/api.php?token=HIDDEN', adapter }, { functionName: 'spec', maxTries: 1, slackChannel: null })).toBeRejectedWith(err);
-    const warnLines = timingLines(warnSpy);
-    expect(warnLines.length).toBe(1);
-    const rec = parseLine(warnLines[0]);
-    expect(rec.status).toBe(503);
-    expect(rec.attempt).toBe('1/1');
-    expect(rec.target).toBe('https://x.test/api.php');
-    expect(warnLines[0]).not.toContain('HIDDEN');
-    expect(warnLines[0]).not.toContain('SUPERSECRET');
-  });
-
-  it('scrubs capability URLs, userinfo and Bearer tokens EMBEDDED in free-text error messages', () => {
-    const out = _timing.scrubErrorText('rejected https://hooks.slack.com/actions/T1/B2/SecretPathToken and https://u:apipass@api.x.test/v1/x?y=1 with Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123');
-    expect(out).not.toContain('SecretPathToken');
-    expect(out).not.toContain('apipass');
-    expect(out).not.toContain('abcdefghijklmnopqrstuvwxyz0123');
-    expect(out).toContain('https://hooks.slack.com '); // scheme + host only
-    expect(out).toContain('https://api.x.test ');
-    expect(out).not.toContain('/v1/x');
-    expect(out).toContain('Authorization: [REDACTED]'); // colon-named credentials mask to end of line
-    // and through the live path (whichever redactor branch this copy runs):
-    expect(_timing.safeErrorText('rejected https://hooks.slack.com/actions/T1/B2/SecretPathToken')).not.toContain('SecretPathToken');
-  });
-
-  it('a `)` inside URL userinfo cannot split the match and leak a password fragment; short credentials (Basic YTpi, short Bearer) are masked too', () => {
-    const out = _timing.scrubErrorText('rejected https://reader:prefix)SecretSuffix@api.example.test/v1 (Authorization: Basic YTpi) and Bearer ab12');
-    expect(out).not.toContain('SecretSuffix');
-    expect(out).not.toContain('prefix)');
-    expect(out).not.toContain('YTpi');
-    expect(out).not.toContain('ab12');
-    expect(out).toContain('https://api.example.test (Authorization: [REDACTED]');
-  });
-
-  it('round 5: aligned stems, multi-word labels, multi-value headers and "Authorization=Bearer …" are all masked', () => {
-    for (const msg of ['API key: SUPERSECRET1', 'Cookie: SID=first; LSID=SUPERSECRET2', 'Authorization: Digest username="u", response="SUPERSECRET3"', 'private_key: SUPERSECRET5 pwd: SUPERSECRET6', 'passphrase: SUPERSECRET7', 'access-key: SUPERSECRET8', 'jwt: SUPERSECRET9', 'X-Access-Key: SUPERSECRET10']) {
-      expect(_timing.scrubErrorText(msg)).withContext(msg).not.toMatch(/SUPERSECRET\d+/);
-    }
-    // The pair form goes through the live safeErrorText path (auth scrub BEFORE the redactor):
-    expect(_timing.safeErrorText({ message: 'Authorization=Bearer SUPERSECRET4' })).not.toContain('SUPERSECRET4');
-  });
-
   it('LOGGED_HTTP_SLOW_MS=0 is a VALID threshold (every call is SLOW); blank, non-numeric and negative values fall back to 2000', async () => {
     expect(_timing.slowThresholdMs()).toBe(2000);
     process.env.LOGGED_HTTP_SLOW_MS = '0';
@@ -135,6 +92,23 @@ describe('loggedHttp per-call timing log', () => {
     for (const bad of ['', '  ', 'abc', '-5', 'NaN']) { process.env.LOGGED_HTTP_SLOW_MS = bad; expect(_timing.slowThresholdMs()).toBe(2000); }
   });
 
+  it('logs a failed attempt to console.warn with err.code + status; the ORIGINAL error rejects; message text is NEVER logged', async () => {
+    const err = new Error('upstream rejected https://x.test/api.php?api_key=SUPERSECRET');
+    err.code = 'ERR_BAD_RESPONSE';
+    err.response = { status: 503, data: {} };
+    const adapter = async () => { throw err; };
+    await expectAsync(loggedHttp({ method: 'get', url: 'https://x.test/api.php?token=HIDDEN', adapter }, { functionName: 'spec', maxTries: 1, slackChannel: null })).toBeRejectedWith(err);
+    const warnLines = timingLines(warnSpy);
+    expect(warnLines.length).toBe(1);
+    const rec = parseLine(warnLines[0]);
+    expect(rec.status).toBe(503);
+    expect(rec.error).toBe('ERR_BAD_RESPONSE');
+    expect(rec.attempt).toBe('1/1');
+    expect(rec.target).toBe('https://x.test/api.php');
+    expect(warnLines[0]).not.toContain('HIDDEN');
+    expect(warnLines[0]).not.toContain('SUPERSECRET');
+  });
+
   it('logs a non-2xx resolved response as "HTTP <status>" only — never the body', async () => {
     await expectAsync(loggedHttp({ method: 'get', url: 'https://example.test/missing', adapter: okAdapter(404, { detail: 'api_key=SUPERSECRET' }) }, { functionName: 'spec', maxTries: 1, slackChannel: null })).toBeRejected();
     const line = timingLines(warnSpy)[0];
@@ -142,12 +116,24 @@ describe('loggedHttp per-call timing log', () => {
     expect(line).not.toContain('SUPERSECRET');
   });
 
-  it('uses the network error code when there is no HTTP status', async () => {
+  it('uses the network error code when there is no HTTP status; "request failed" when there is neither', async () => {
     const err = new Error('timeout of 30000ms exceeded'); err.code = 'ECONNABORTED';
     await expectAsync(loggedHttp({ method: 'get', url: 'https://example.test/slow', adapter: async () => { throw err; } }, { functionName: 'spec', maxTries: 1, slackChannel: null })).toBeRejected();
     const rec = parseLine(timingLines(warnSpy)[0]);
     expect(rec.status).toBeNull();
     expect(rec.error).toBe('ECONNABORTED');
+    warnSpy.calls.reset();
+    await expectAsync(loggedHttp({ method: 'get', url: 'https://example.test/slow', adapter: async () => { throw new Error('API key SUPERSECRET'); } }, { functionName: 'spec', maxTries: 1, slackChannel: null })).toBeRejected();
+    expect(parseLine(timingLines(warnSpy)[0]).error).toBe('request failed');
+    expect(allOutput()).not.toContain('SUPERSECRET');
+  });
+
+  it('errorCodeText: code wins, then HTTP <status>, then "request failed"; message text is never consulted', () => {
+    expect(_timing.errorCodeText({ code: 'ECONNRESET' })).toBe('ECONNRESET');
+    expect(_timing.errorCodeText({ code: 'ECONNRESET', status: 503 })).toBe('ECONNRESET');
+    expect(_timing.errorCodeText({ status: 503 })).toBe('HTTP 503');
+    expect(_timing.errorCodeText({})).toBe('request failed');
+    expect(_timing.errorCodeText({ code: 'not a code' })).toBe('request failed');
   });
 
   it('emits ONE line PER ATTEMPT across retries: warn "1/2" then success "2/2"', async () => {
@@ -177,33 +163,10 @@ describe('loggedHttp per-call timing log', () => {
     await expectAsync(loggedHttp({ method: 'get', url: 'https://example.test/x', adapter: async () => { throw netErr; } }, { functionName: 'spec', maxTries: 1, slackChannel: null })).toBeRejectedWith(netErr);
   });
 
-  it('safeErrorText: redactor present → scrubbed; redactor absent → fail closed on provenance (only err.code / HTTP n, never message text)', async () => {
-    // This copy's reportExceptions export set decides which branch is live (see the
-    // namespace-import note in utils/loggedHttp.js). Either way no secret may pass.
-    const ns = await import('../utils/reportExceptions.js');
-    const hasRedactor = typeof ns.redactUrl === 'function';
-    expect(_timing.safeErrorText({ message: 'upstream said api_key=SUPERSECRET' })).not.toContain('SUPERSECRET');
-    expect(_timing.safeErrorText({ code: 'ECONNRESET' })).toBe('ECONNRESET');
-    expect(_timing.safeErrorText({ code: 'HTTP 503' })).toBe('HTTP 503');
-    const codeLooking = _timing.safeErrorText({ message: 'SUPERSECRETTOKEN_ABC123' });
-    if (hasRedactor) expect(codeLooking).toBe('SUPERSECRETTOKEN_ABC123'); // free text passes the redactor branch (no known pattern)
-    else expect(codeLooking).toBe('<error text withheld: redactor unavailable>'); // fail closed: shape is not provenance
-  });
-
-  it('compact JSON with two URLs in one token, and colon-delimited credentials, are scrubbed', () => {
-    const out = _timing.scrubErrorText('rejected {"url":"https://api.x.test/v1","next":"https://hooks.slack.com/actions/T/B/SecretPathToken"} X-API-Key: SUPERSECRET1, api_key: SUPERSECRET2 Authorization: Bearer SUPERSECRET4');
-    for (const s of ['SecretPathToken', 'SUPERSECRET1', 'SUPERSECRET2', 'SUPERSECRET4']) expect(out).not.toContain(s);
-    expect(out.startsWith('rejected {"url":"https://api.x.test X-API-Key: [REDACTED]')).toBe(true); // token → first URL's scheme+host only
-    expect(out).not.toContain('hooks.slack.com/actions');
-    expect(out).toContain('X-API-Key: [REDACTED]');
-    expect(out).not.toContain('SUPERSECRET');
-  });
-
-  it('a rejected object whose code/message/response getters THROW does not alter the call (every attempt still runs)', async () => {
-    // Through the real axios pipeline the adapter rejection is normalised by axios
-    // itself (it reads `reason.response`), so the identity of the rejection is axios's
-    // business here; what loggedHttp owes is that its telemetry never skips a retry or
-    // swallows the failure. logTiming itself is pinned directly below.
+  it('a rejected object whose code/message/response getters THROW does not alter the call (every attempt still runs) and logTiming still emits its line', async () => {
+    // Through the real axios pipeline the adapter rejection is normalised by axios itself
+    // (it reads `reason.response`), so the rejection identity is axios's business here; what
+    // loggedHttp owes is that telemetry never skips a retry or swallows the failure.
     const evil = {};
     Object.defineProperty(evil, 'code', { get() { throw new Error('getter boom'); } });
     Object.defineProperty(evil, 'message', { get() { throw new Error('getter boom'); } });
@@ -212,18 +175,9 @@ describe('loggedHttp per-call timing log', () => {
     const adapter = async () => { calls += 1; throw evil; };
     await expectAsync(loggedHttp({ method: 'get', url: 'https://example.test/x', adapter }, { functionName: 'spec', maxTries: 2, retryInterval: 0, slackChannel: null })).toBeRejected();
     expect(calls).toBe(2);
-    // Direct: logTiming with the hostile object neither throws nor drops its line — details marked unreadable.
     warnSpy.calls.reset();
     expect(() => _timing.logTiming({ functionName: 'spec', method: 'get', url: 'https://example.test/x', attempt: 1, maxTries: 1, durationMs: 1, err: evil })).not.toThrow();
     expect(timingLines(warnSpy).length).toBe(1);
     expect(parseLine(timingLines(warnSpy)[0]).error).toBe('<error details unreadable>');
-  });
-
-  it('URL path suffixes after `;` or `,` on a capability host, quoted JSON keys with unquoted values, and escaped quotes inside quoted values are all masked', () => {
-    const out = _timing.scrubErrorText('rejected https://hooks.slack.com/services/T,B/SecretSuffix1 and https://hooks.slack.com/actions/T/B/Prefix;SecretSuffix2 {"api_key":123456} password: "prefix\\"SecretSuffix3" done');
-    for (const s of ['SecretSuffix1', 'SecretSuffix2', '123456', 'SecretSuffix3']) expect(out).not.toContain(s);
-    expect(out).toContain('https://hooks.slack.com and https://hooks.slack.com ');
-    expect(out).toContain('api_key: [REDACTED]');
-    expect(out).not.toContain('done'); // masked to end of line
   });
 });

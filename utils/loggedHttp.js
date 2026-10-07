@@ -1,9 +1,5 @@
 import axios from 'axios';
-import * as reportExceptionsModule from './reportExceptions.js';
-// Namespace import: one sibling (context_helpscout_saved_replies_lambda) has no
-// redactUrl export, and a missing NAMED import is a link-time SyntaxError in ESM.
-// Reading it off the namespace yields undefined there → safeErrorText fails closed.
-const { reportExceptionToSlack, redactUrl } = reportExceptionsModule;
+import { reportExceptionToSlack } from './reportExceptions.js';
 
 // ── Per-call timing log (ported from ts_lambda PR #238, owner-directed 2026-10-07) ──
 // Until now loggedHttp logged NOTHING on a successful call, so a slow external
@@ -18,9 +14,8 @@ const { reportExceptionToSlack, redactUrl } = reportExceptionsModule;
 // Secret-safe by construction: method, host and PATH only — never the query string
 // (ActiveCampaign carries `api_key` there) — and the path is `/<redacted>` for
 // capability-URL hosts (hooks.slack.com response_urls, hooks.zapier.com,
-// webhook.botpress.cloud), where the path IS the credential. Error text passes
-// through reportExceptions.redactUrl when available and FAILS CLOSED (bare codes
-// only) when it is not.
+// webhook.botpress.cloud), where the path IS the credential. The `error` field is a
+// provenance-known CODE only — message text is never logged here (see errorCodeText).
 // NEVER-THROW CONTRACT: logTiming runs inside the retry loop's try/catch; a throw
 // there would turn a 2xx into a retried (duplicated) write or replace the real
 // network error. Telemetry must not alter the call it observes.
@@ -44,103 +39,31 @@ function timingTarget(url) {
 
 /**
  * A bare error code as produced by Node/axios (`ECONNRESET`, `EAI_AGAIN`,
- * `ERR_BAD_RESPONSE`) or by us (`HTTP 503`). Used ONLY to validate a value whose
- * provenance is already known to be a code (err.code / our own `HTTP <status>`) —
- * never to classify free text (an uppercase secret would pass a shape test).
+ * `ERR_BAD_RESPONSE`) or by us (`HTTP 503`). Shape check on a value whose provenance
+ * is already `err.code` — never used to classify free text.
  */
 const BARE_ERROR_CODE_RE = /^(?:[A-Z][A-Z0-9_]{2,39}|HTTP \d{3})$/;
 
 /**
- * Free-text scrubbing (Copilot on the port, 2026-10-07, four rounds).
- * - A URL embedded in free text is reduced to SCHEME + HOST only. Nothing after the
- *   host is ever emitted: paths can be capability credentials, queries can carry keys,
- *   userinfo can carry passwords, and compact JSON can glue a second URL onto the
- *   first. Every delimiter heuristic tried in review leaked a suffix (`;` and `,` are
- *   legal path characters; a parseable head proves nothing about where the URL ends).
- *   The request's own path is already in the structured `target` field, so host-only
- *   costs no diagnostic signal here. Tokens run to the next whitespace; an unparseable
- *   token is withheld whole.
- * - Auth-scheme credentials have NO minimum length (`Basic YTpi` is valid).
- * - Colon-delimited credentials (`X-API-Key: …`, `"api_key":123456`, `password: "a\"b"`)
- *   are masked: optional quotes around the name, quoted values consume escaped
- *   characters, unquoted values run to whitespace / `,` `;` `}` `]`. Over-redaction
- *   of innocent text ("token expired") is accepted.
- */
-const URL_IN_TEXT_RE = /https?:\/\/\S+/gi;
-/**
- * Sensitive-name stems — the SAME list reportExceptions' SENSITIVE_KEY_RE uses, so the
- * two redaction passes can never disagree about what is a credential name (Copilot on
- * the port, round 5). Compound stems accept space as well as - and _ ("API key").
- */
-const SENSITIVE_STEMS = 'auth|bearer|cookie|token|secret|credential|password|passwd|pwd|passphrase|api[-_ ]?key|apikey|access[-_ ]?key|private[-_ ]?key|signature|session|jwt';
-/** Single-token schemes: credential is the next token (no minimum length — `Basic YTpi` is valid). */
-const AUTH_SCHEME_RE = /\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]+/gi;
-/** List schemes (Digest, and anything else that carries a comma list): mask to end of line. */
-const AUTH_LIST_SCHEME_RE = /\b(Digest|Negotiate|NTLM|AWS4-HMAC-SHA256)\s+[^\n]*/gi;
-/**
- * A colon-delimited credential — `X-API-Key: …`, `"api_key":123456`, `API key: …`,
- * `Cookie: SID=a; LSID=b`, `Authorization: Digest …`. The value is masked to END OF
- * LINE: multi-value headers, digest parameter lists and multi-word values all leaked
- * a tail under narrower value patterns (rounds 4–5). Over-redaction of the rest of a
- * one-line message is the accepted price.
- */
-const COLON_CREDENTIAL_RE = new RegExp(`["']?\\b((?:[\\w-]+[\\s_-])?(?:${SENSITIVE_STEMS})[\\w-]*)\\b["']?\\s*:\\s*(?!\\[REDACTED\\]\\s*$)[^\\n]*`, 'gi');
-
-/**
- * Scheme + host of a URL token found in free text; the whole token is withheld when
- * it does not parse.
- * @param {string} token - e.g. 'https://hooks.slack.com/actions/T/B/SECRET;more' | 'https://u:p@api.x.test/v1?k=v'
- * @returns {string} 'https://hooks.slack.com' | 'https://api.x.test' | '<unparseable-url>'
- */
-function hostOnly(token) {
-  try {
-    const parsed = new URL(String(token));
-    return `${parsed.protocol}//${parsed.host}`;
-  } catch (e) {
-    return '<unparseable-url>';
-  }
-}
-
-/**
- * Scrub what redactUrl does NOT cover in free text.
+ * The timing line's `error` field: a provenance-known CODE ONLY.
  *
- * @param {string} text - e.g. 'rejected {"next":"https://hooks.slack.com/actions/T/B/SECRET"} X-API-Key: SECRET2 with Bearer abc'
- * @returns {string} 'rejected {"next":"https://hooks.slack.com X-API-Key: [REDACTED] with Bearer [REDACTED]'
- */
-function scrubAuthSchemes(text) {
-  return String(text)
-    .replace(AUTH_SCHEME_RE, '$1 [REDACTED]')
-    .replace(AUTH_LIST_SCHEME_RE, '$1 [REDACTED]');
-}
-
-function scrubErrorText(text) {
-  return scrubAuthSchemes(text)
-    .replace(URL_IN_TEXT_RE, hostOnly)
-    .replace(COLON_CREDENTIAL_RE, '$1: [REDACTED]');
-}
-
-/**
- * Secret-safe rendering of the `error` field. With the redactor available the text
- * (code, else message) is scrubbed — redactUrl pairs, then scrubErrorText — and
- * truncated. Without it (reportExceptions stubbed in require.cache) FAIL CLOSED:
- * only a provenance-known code is emitted (err.code or our `HTTP <status>`), never
- * message text, however code-like it looks.
+ * DESIGN RULING (Copilot on the port, 2026-10-07, six rounds): `err.message` is
+ * arbitrary free text — camelCase credential labels, delimiter-less `API key SECRET`,
+ * multiline PEM values, spaced `name=value`, compact JSON, capability URLs — and
+ * every pattern list proposed in review leaked something the next round. Free text
+ * cannot be made secret-safe by pattern, so this line never carries it. What it
+ * carries is enough to attribute a slow or failing dependency: the structured
+ * `target` (host + path), `status`, `ms`, and this code. The message itself still
+ * reaches the error channel through reportExceptions, whose redaction policy is the
+ * owner-adjudicated one for that surface.
  *
- * @param {{code?: string, message?: string}} parts - e.g. { code: 'ECONNRESET' } |
- *   { message: 'upstream said api_key=SECRET' } | { code: 'HTTP 503' }
- * @returns {string} 'ECONNRESET' | 'upstream said api_key=[REDACTED]' (redactor present) |
- *   '<error text withheld: redactor unavailable>' (redactor absent, no code)
+ * @param {{code?: *, status?: number}} parts - e.g. { code: 'ECONNRESET' } | { status: 503 } | {}
+ * @returns {string} 'ECONNRESET' | 'HTTP 503' | 'request failed'
  */
-function safeErrorText(parts) {
-  const { code, message } = (parts && typeof parts === 'object') ? parts : { message: parts };
-  if (typeof redactUrl === 'function') {
-    const text = code || message || 'request failed';
-    // Auth schemes are scrubbed BEFORE redactUrl too: for `Authorization=Bearer TOPSECRET`
-    // redactUrl's pair pass consumes the scheme word as the pair's value and the token
-    // would otherwise survive unrecognised (Copilot on the port, round 5).
-    return scrubErrorText(redactUrl(scrubAuthSchemes(String(text)))).slice(0, 160);
-  }
-  return (typeof code === 'string' && BARE_ERROR_CODE_RE.test(code)) ? code : '<error text withheld: redactor unavailable>';
+function errorCodeText({ code, status } = {}) {
+  if (typeof code === 'string' && BARE_ERROR_CODE_RE.test(code)) return code;
+  if (Number.isFinite(status)) return `HTTP ${status}`;
+  return 'request failed';
 }
 
 /**
@@ -185,20 +108,14 @@ function logTiming({ functionName, method, url, attempt, maxTries, durationMs, r
     const rawMessage = err ? safeRead(err, 'message') : undefined;
     const rawResponse = err ? safeRead(err, 'response') : undefined;
     const rawStatus = response ? safeRead(response, 'status') : (rawResponse && rawResponse !== UNREADABLE ? safeRead(rawResponse, 'status') : undefined);
-    const unreadable = [rawCode, rawMessage, rawResponse, rawStatus].includes(UNREADABLE);
+    const unreadable = [rawCode, rawMessage, rawResponse, rawStatus].includes(UNREADABLE); // message is read only to detect hostile getters — never logged
     const status = Number.isFinite(rawStatus) ? rawStatus : undefined;
     const isFailure = Boolean(err) || Boolean(failed);
     let errorText;
     if (isFailure) {
-      if (unreadable) {
-        errorText = '<error details unreadable>';
-      } else {
-        const code = err
-          ? (typeof rawCode === 'string' ? rawCode : undefined)
-          : (status !== undefined ? `HTTP ${status}` : undefined);
-        const message = typeof rawMessage === 'string' ? rawMessage : undefined;
-        errorText = safeErrorText({ code, message });
-      }
+      errorText = unreadable
+        ? '<error details unreadable>'
+        : errorCodeText({ code: err ? rawCode : undefined, status });
     }
     const record = {
       fn: functionName,
@@ -298,4 +215,4 @@ loggedHttp.post = function(url, data = {}, config = {}) {
 };
 
 export default loggedHttp;
-export const _timing = { timingTarget, logTiming, safeErrorText, scrubErrorText, slowThresholdMs, DEFAULT_SLOW_MS };
+export const _timing = { timingTarget, logTiming, errorCodeText, slowThresholdMs, DEFAULT_SLOW_MS };
