@@ -107,6 +107,16 @@ describe('loggedHttp per-call timing log', () => {
     expect(_timing.safeErrorText('rejected https://hooks.slack.com/actions/T1/B2/SecretPathToken')).not.toContain('SecretPathToken');
   });
 
+  it('a `)` inside URL userinfo cannot split the match and leak a password fragment; short credentials (Basic YTpi, short Bearer) are masked too', () => {
+    const out = _timing.scrubErrorText('rejected https://reader:prefix)SecretSuffix@api.example.test/v1 (Authorization: Basic YTpi) and Bearer ab12');
+    expect(out).not.toContain('SecretSuffix');
+    expect(out).not.toContain('prefix)');
+    expect(out).not.toContain('YTpi');
+    expect(out).not.toContain('ab12');
+    expect(out).toContain('Basic [REDACTED]');
+    expect(out).toContain('Bearer [REDACTED]');
+  });
+
   it('LOGGED_HTTP_SLOW_MS=0 is a VALID threshold (every call is SLOW); blank, non-numeric and negative values fall back to 2000', async () => {
     expect(_timing.slowThresholdMs()).toBe(2000);
     process.env.LOGGED_HTTP_SLOW_MS = '0';

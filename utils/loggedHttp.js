@@ -44,9 +44,18 @@ function timingTarget(url) {
   }
 }
 
-/** Any URL embedded in free text, and Bearer/Basic/token credentials (Copilot on the port, 2026-10-07). */
-const URL_IN_TEXT_RE = /https?:\/\/[^\s"'<>)]+/gi;
-const AUTH_SCHEME_RE = /\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+/**
+ * Any URL embedded in free text, and Bearer/Basic/token credentials (Copilot on the
+ * port, 2026-10-07, two rounds). The URL match runs to the next WHITESPACE on
+ * purpose: userinfo may legally contain `)` `"` `'` `<` `>`, and a matcher that
+ * stopped there left the rest of a password in clear after `<unparseable-url>`.
+ * Trailing prose punctuation is therefore swallowed into the token — a harmless
+ * over-match (the whole token is either rendered host+path or `<unparseable-url>`).
+ * The credential match has NO minimum length: `Basic YTpi` (a:b) is a valid
+ * credential. Over-redaction of an innocent "token expired" is accepted.
+ */
+const URL_IN_TEXT_RE = /https?:\/\/\S+/gi;
+const AUTH_SCHEME_RE = /\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]+/gi;
 
 /**
  * Scrub what redactUrl does NOT cover in free text: embedded URLs are reduced to
