@@ -103,7 +103,7 @@ describe('loggedHttp per-call timing log', () => {
     expect(out).toContain('https://hooks.slack.com '); // scheme + host only
     expect(out).toContain('https://api.x.test ');
     expect(out).not.toContain('/v1/x');
-    expect(out).toContain('Bearer [REDACTED]');
+    expect(out).toContain('Authorization: [REDACTED]'); // colon-named credentials mask to end of line
     // and through the live path (whichever redactor branch this copy runs):
     expect(_timing.safeErrorText('rejected https://hooks.slack.com/actions/T1/B2/SecretPathToken')).not.toContain('SecretPathToken');
   });
@@ -114,8 +114,15 @@ describe('loggedHttp per-call timing log', () => {
     expect(out).not.toContain('prefix)');
     expect(out).not.toContain('YTpi');
     expect(out).not.toContain('ab12');
-    expect(out).toContain('Basic [REDACTED]');
-    expect(out).toContain('Bearer [REDACTED]');
+    expect(out).toContain('https://api.example.test (Authorization: [REDACTED]');
+  });
+
+  it('round 5: aligned stems, multi-word labels, multi-value headers and "Authorization=Bearer …" are all masked', () => {
+    for (const msg of ['API key: SUPERSECRET1', 'Cookie: SID=first; LSID=SUPERSECRET2', 'Authorization: Digest username="u", response="SUPERSECRET3"', 'private_key: SUPERSECRET5 pwd: SUPERSECRET6', 'passphrase: SUPERSECRET7', 'access-key: SUPERSECRET8', 'jwt: SUPERSECRET9', 'X-Access-Key: SUPERSECRET10']) {
+      expect(_timing.scrubErrorText(msg)).withContext(msg).not.toMatch(/SUPERSECRET\d+/);
+    }
+    // The pair form goes through the live safeErrorText path (auth scrub BEFORE the redactor):
+    expect(_timing.safeErrorText({ message: 'Authorization=Bearer SUPERSECRET4' })).not.toContain('SUPERSECRET4');
   });
 
   it('LOGGED_HTTP_SLOW_MS=0 is a VALID threshold (every call is SLOW); blank, non-numeric and negative values fall back to 2000', async () => {
@@ -189,7 +196,7 @@ describe('loggedHttp per-call timing log', () => {
     expect(out.startsWith('rejected {"url":"https://api.x.test X-API-Key: [REDACTED]')).toBe(true); // token → first URL's scheme+host only
     expect(out).not.toContain('hooks.slack.com/actions');
     expect(out).toContain('X-API-Key: [REDACTED]');
-    expect(out).toContain('Authorization: Bearer [REDACTED]');
+    expect(out).not.toContain('SUPERSECRET');
   });
 
   it('a rejected object whose code/message/response getters THROW does not alter the call (every attempt still runs)', async () => {
@@ -217,6 +224,6 @@ describe('loggedHttp per-call timing log', () => {
     for (const s of ['SecretSuffix1', 'SecretSuffix2', '123456', 'SecretSuffix3']) expect(out).not.toContain(s);
     expect(out).toContain('https://hooks.slack.com and https://hooks.slack.com ');
     expect(out).toContain('api_key: [REDACTED]');
-    expect(out).toContain('password: [REDACTED] done');
+    expect(out).not.toContain('done'); // masked to end of line
   });
 });

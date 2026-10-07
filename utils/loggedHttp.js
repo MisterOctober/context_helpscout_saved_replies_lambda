@@ -67,8 +67,24 @@ const BARE_ERROR_CODE_RE = /^(?:[A-Z][A-Z0-9_]{2,39}|HTTP \d{3})$/;
  *   of innocent text ("token expired") is accepted.
  */
 const URL_IN_TEXT_RE = /https?:\/\/\S+/gi;
+/**
+ * Sensitive-name stems — the SAME list reportExceptions' SENSITIVE_KEY_RE uses, so the
+ * two redaction passes can never disagree about what is a credential name (Copilot on
+ * the port, round 5). Compound stems accept space as well as - and _ ("API key").
+ */
+const SENSITIVE_STEMS = 'auth|bearer|cookie|token|secret|credential|password|passwd|pwd|passphrase|api[-_ ]?key|apikey|access[-_ ]?key|private[-_ ]?key|signature|session|jwt';
+/** Single-token schemes: credential is the next token (no minimum length — `Basic YTpi` is valid). */
 const AUTH_SCHEME_RE = /\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]+/gi;
-const COLON_CREDENTIAL_RE = /["']?\b([\w-]*(?:secret|passw(?:or)?d|token|api[_-]?key|authorization|credential|signature|session|cookie|auth)[\w-]*)\b["']?\s*:\s*(?!Bearer\b|Basic\b|\[REDACTED\])("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;}\]]+)/gi;
+/** List schemes (Digest, and anything else that carries a comma list): mask to end of line. */
+const AUTH_LIST_SCHEME_RE = /\b(Digest|Negotiate|NTLM|AWS4-HMAC-SHA256)\s+[^\n]*/gi;
+/**
+ * A colon-delimited credential — `X-API-Key: …`, `"api_key":123456`, `API key: …`,
+ * `Cookie: SID=a; LSID=b`, `Authorization: Digest …`. The value is masked to END OF
+ * LINE: multi-value headers, digest parameter lists and multi-word values all leaked
+ * a tail under narrower value patterns (rounds 4–5). Over-redaction of the rest of a
+ * one-line message is the accepted price.
+ */
+const COLON_CREDENTIAL_RE = new RegExp(`["']?\\b((?:[\\w-]+[\\s_-])?(?:${SENSITIVE_STEMS})[\\w-]*)\\b["']?\\s*:\\s*(?!\\[REDACTED\\]\\s*$)[^\\n]*`, 'gi');
 
 /**
  * Scheme + host of a URL token found in free text; the whole token is withheld when
@@ -91,10 +107,15 @@ function hostOnly(token) {
  * @param {string} text - e.g. 'rejected {"next":"https://hooks.slack.com/actions/T/B/SECRET"} X-API-Key: SECRET2 with Bearer abc'
  * @returns {string} 'rejected {"next":"https://hooks.slack.com X-API-Key: [REDACTED] with Bearer [REDACTED]'
  */
-function scrubErrorText(text) {
+function scrubAuthSchemes(text) {
   return String(text)
-    .replace(URL_IN_TEXT_RE, hostOnly)
     .replace(AUTH_SCHEME_RE, '$1 [REDACTED]')
+    .replace(AUTH_LIST_SCHEME_RE, '$1 [REDACTED]');
+}
+
+function scrubErrorText(text) {
+  return scrubAuthSchemes(text)
+    .replace(URL_IN_TEXT_RE, hostOnly)
     .replace(COLON_CREDENTIAL_RE, '$1: [REDACTED]');
 }
 
@@ -114,7 +135,10 @@ function safeErrorText(parts) {
   const { code, message } = (parts && typeof parts === 'object') ? parts : { message: parts };
   if (typeof redactUrl === 'function') {
     const text = code || message || 'request failed';
-    return scrubErrorText(redactUrl(String(text))).slice(0, 160);
+    // Auth schemes are scrubbed BEFORE redactUrl too: for `Authorization=Bearer TOPSECRET`
+    // redactUrl's pair pass consumes the scheme word as the pair's value and the token
+    // would otherwise survive unrecognised (Copilot on the port, round 5).
+    return scrubErrorText(redactUrl(scrubAuthSchemes(String(text)))).slice(0, 160);
   }
   return (typeof code === 'string' && BARE_ERROR_CODE_RE.test(code)) ? code : '<error text withheld: redactor unavailable>';
 }
