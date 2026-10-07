@@ -44,16 +44,49 @@ function timingTarget(url) {
   }
 }
 
+/** Any URL embedded in free text, and Bearer/Basic/token credentials (Copilot on the port, 2026-10-07). */
+const URL_IN_TEXT_RE = /https?:\/\/[^\s"'<>)]+/gi;
+const AUTH_SCHEME_RE = /\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+
 /**
- * Secret-safe rendering of the `error` field: scrubbed + truncated with the
- * redactor; bare codes only (free text withheld) without it.
+ * Scrub what redactUrl does NOT cover in free text: embedded URLs are reduced to
+ * their timing-target form (host + path, capability-host paths redacted, userinfo
+ * and query dropped) and auth-scheme credentials are masked.
+ *
+ * @param {string} text - e.g. 'rejected https://hooks.slack.com/actions/T/B/SECRET with Bearer abcdefghijkl'
+ * @returns {string} 'rejected https://hooks.slack.com/<redacted> with Bearer [REDACTED]'
+ */
+function scrubErrorText(text) {
+  return String(text)
+    .replace(URL_IN_TEXT_RE, (url) => timingTarget(url))
+    .replace(AUTH_SCHEME_RE, '$1 [REDACTED]');
+}
+
+/**
+ * Secret-safe rendering of the `error` field: redactUrl pairs, then scrubErrorText for
+ * embedded URLs and auth-scheme credentials, then truncated — with the redactor;
+ * bare codes only (free text withheld) without it.
  * @param {*} error - e.g. 'ECONNRESET' | 'upstream said api_key=SECRET' | 'HTTP 503'
  * @returns {string}
  */
 function safeErrorText(error) {
   const text = String(error);
-  if (typeof redactUrl === 'function') return String(redactUrl(text)).slice(0, 160);
+  if (typeof redactUrl === 'function') return scrubErrorText(redactUrl(text)).slice(0, 160);
   return BARE_ERROR_CODE_RE.test(text) ? text : '<error text withheld: redactor unavailable>';
+}
+
+/**
+ * The SLOW threshold from LOGGED_HTTP_SLOW_MS. Zero is a VALID value (every call
+ * is SLOW — useful when hunting); unset, blank, non-numeric or negative values
+ * fall back to the default (Copilot on the port: `Number(env) || DEFAULT` discarded 0).
+ *
+ * @returns {number} e.g. 0 for '0', 2000 for undefined / '' / 'abc' / '-5'
+ */
+function slowThresholdMs() {
+  const raw = process.env.LOGGED_HTTP_SLOW_MS;
+  if (raw === undefined || String(raw).trim() === '') return DEFAULT_SLOW_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_SLOW_MS;
 }
 
 /**
@@ -63,7 +96,7 @@ function safeErrorText(error) {
  */
 function logTiming({ functionName, method, url, attempt, maxTries, status, durationMs, error }) {
   try {
-    const slowMs = Number(process.env.LOGGED_HTTP_SLOW_MS) || DEFAULT_SLOW_MS;
+    const slowMs = slowThresholdMs();
     const record = {
       fn: functionName,
       method: String(method || 'get').toUpperCase(),
@@ -162,4 +195,4 @@ loggedHttp.post = function(url, data = {}, config = {}) {
 };
 
 export default loggedHttp;
-export const _timing = { timingTarget, logTiming, safeErrorText, DEFAULT_SLOW_MS };
+export const _timing = { timingTarget, logTiming, safeErrorText, scrubErrorText, slowThresholdMs, DEFAULT_SLOW_MS };

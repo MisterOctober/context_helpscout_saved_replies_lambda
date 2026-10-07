@@ -95,6 +95,28 @@ describe('loggedHttp per-call timing log', () => {
     expect(warnLines[0]).not.toContain('SUPERSECRET');
   });
 
+  it('scrubs capability URLs, userinfo and Bearer tokens EMBEDDED in free-text error messages', () => {
+    const out = _timing.scrubErrorText('rejected https://hooks.slack.com/actions/T1/B2/SecretPathToken and https://u:apipass@api.x.test/v1/x?y=1 with Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123');
+    expect(out).not.toContain('SecretPathToken');
+    expect(out).not.toContain('apipass');
+    expect(out).not.toContain('abcdefghijklmnopqrstuvwxyz0123');
+    expect(out).toContain('https://hooks.slack.com/<redacted>');
+    expect(out).toContain('https://api.x.test/v1/x');
+    expect(out).toContain('Bearer [REDACTED]');
+    // and through the live path (whichever redactor branch this copy runs):
+    expect(_timing.safeErrorText('rejected https://hooks.slack.com/actions/T1/B2/SecretPathToken')).not.toContain('SecretPathToken');
+  });
+
+  it('LOGGED_HTTP_SLOW_MS=0 is a VALID threshold (every call is SLOW); blank, non-numeric and negative values fall back to 2000', async () => {
+    expect(_timing.slowThresholdMs()).toBe(2000);
+    process.env.LOGGED_HTTP_SLOW_MS = '0';
+    expect(_timing.slowThresholdMs()).toBe(0);
+    await loggedHttp({ method: 'get', url: 'https://example.test/x', adapter: okAdapter() }, { functionName: 'spec' });
+    expect(timingLines(warnSpy).length).toBe(1);
+    expect(timingLines(warnSpy)[0].startsWith('loggedHttp timing SLOW ')).toBe(true);
+    for (const bad of ['', '  ', 'abc', '-5', 'NaN']) { process.env.LOGGED_HTTP_SLOW_MS = bad; expect(_timing.slowThresholdMs()).toBe(2000); }
+  });
+
   it('logs a non-2xx resolved response as "HTTP <status>" only — never the body', async () => {
     await expectAsync(loggedHttp({ method: 'get', url: 'https://example.test/missing', adapter: okAdapter(404, { detail: 'api_key=SUPERSECRET' }) }, { functionName: 'spec', maxTries: 1, slackChannel: null })).toBeRejected();
     const line = timingLines(warnSpy)[0];
