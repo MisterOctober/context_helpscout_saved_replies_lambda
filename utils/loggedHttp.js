@@ -51,45 +51,49 @@ function timingTarget(url) {
 const BARE_ERROR_CODE_RE = /^(?:[A-Z][A-Z0-9_]{2,39}|HTTP \d{3})$/;
 
 /**
- * Free-text scrubbing (Copilot on the port, 2026-10-07, three rounds).
- * - URL tokens run to the next WHITESPACE: userinfo may legally contain `)` `"` `'`
- *   `<` `>`, and a matcher that stopped there left the rest of a password in clear.
- * - Inside a token, a JSON/quote/bracket delimiter ends the URL proper; the
- *   remainder (which may hold ANOTHER URL — compact JSON `{"url":"…","next":"https://hooks…"}`)
- *   is scrubbed recursively instead of being rendered as the first URL's path.
- *   If the head is unparseable the WHOLE token is withheld (a quote inside userinfo
- *   must not leak what follows).
- * - Auth-scheme credentials have NO minimum length (`Basic YTpi` is valid), and
- *   colon-delimited credentials (`X-API-Key: …`, `api_key: …`, `password: …`) are
- *   masked too. Over-redaction of innocent text ("token expired") is accepted.
+ * Free-text scrubbing (Copilot on the port, 2026-10-07, four rounds).
+ * - A URL embedded in free text is reduced to SCHEME + HOST only. Nothing after the
+ *   host is ever emitted: paths can be capability credentials, queries can carry keys,
+ *   userinfo can carry passwords, and compact JSON can glue a second URL onto the
+ *   first. Every delimiter heuristic tried in review leaked a suffix (`;` and `,` are
+ *   legal path characters; a parseable head proves nothing about where the URL ends).
+ *   The request's own path is already in the structured `target` field, so host-only
+ *   costs no diagnostic signal here. Tokens run to the next whitespace; an unparseable
+ *   token is withheld whole.
+ * - Auth-scheme credentials have NO minimum length (`Basic YTpi` is valid).
+ * - Colon-delimited credentials (`X-API-Key: …`, `"api_key":123456`, `password: "a\"b"`)
+ *   are masked: optional quotes around the name, quoted values consume escaped
+ *   characters, unquoted values run to whitespace / `,` `;` `}` `]`. Over-redaction
+ *   of innocent text ("token expired") is accepted.
  */
 const URL_IN_TEXT_RE = /https?:\/\/\S+/gi;
-const URL_TOKEN_DELIM_RE = /["'<>{}\[\],;]/;
 const AUTH_SCHEME_RE = /\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]+/gi;
-const COLON_CREDENTIAL_RE = /\b([\w-]*(?:secret|passw(?:or)?d|token|api[_-]?key|authorization|credential|signature|session|cookie|auth)[\w-]*)\s*:\s*(?!Bearer\b|Basic\b|\[REDACTED\])("[^"]*"|'[^']*'|[^\s,;}\]]+)/gi;
-const MAX_SCRUB_DEPTH = 4;
+const COLON_CREDENTIAL_RE = /["']?\b([\w-]*(?:secret|passw(?:or)?d|token|api[_-]?key|authorization|credential|signature|session|cookie|auth)[\w-]*)\b["']?\s*:\s*(?!Bearer\b|Basic\b|\[REDACTED\])("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;}\]]+)/gi;
+
+/**
+ * Scheme + host of a URL token found in free text; the whole token is withheld when
+ * it does not parse.
+ * @param {string} token - e.g. 'https://hooks.slack.com/actions/T/B/SECRET;more' | 'https://u:p@api.x.test/v1?k=v'
+ * @returns {string} 'https://hooks.slack.com' | 'https://api.x.test' | '<unparseable-url>'
+ */
+function hostOnly(token) {
+  try {
+    const parsed = new URL(String(token));
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch (e) {
+    return '<unparseable-url>';
+  }
+}
 
 /**
  * Scrub what redactUrl does NOT cover in free text.
  *
  * @param {string} text - e.g. 'rejected {"next":"https://hooks.slack.com/actions/T/B/SECRET"} X-API-Key: SECRET2 with Bearer abc'
- * @param {number} [depth] - recursion guard for nested URL tokens
- * @returns {string} 'rejected {"next":"https://hooks.slack.com/<redacted>"} X-API-Key: [REDACTED] with Bearer [REDACTED]'
+ * @returns {string} 'rejected {"next":"https://hooks.slack.com X-API-Key: [REDACTED] with Bearer [REDACTED]'
  */
-function scrubErrorText(text, depth = 0) {
-  if (depth > MAX_SCRUB_DEPTH) return '<error text truncated: nesting>';
+function scrubErrorText(text) {
   return String(text)
-    .replace(URL_IN_TEXT_RE, (token) => {
-      const at = token.search(URL_TOKEN_DELIM_RE);
-      if (at === -1) return timingTarget(token);
-      const head = token.slice(0, at);
-      const rendered = timingTarget(head);
-      if (rendered === '<unparseable-url>') return rendered; // whole token withheld
-      // Delimiter inside the QUERY/FRAGMENT → the remainder is query text (possibly a
-      // redacted pair or a nested redirect URL): drop it, never re-emit a query fragment.
-      if (/[?#]/.test(head)) return rendered;
-      return rendered + scrubErrorText(token.slice(at), depth + 1);
-    })
+    .replace(URL_IN_TEXT_RE, hostOnly)
     .replace(AUTH_SCHEME_RE, '$1 [REDACTED]')
     .replace(COLON_CREDENTIAL_RE, '$1: [REDACTED]');
 }
@@ -148,15 +152,29 @@ function logTiming({ functionName, method, url, attempt, maxTries, durationMs, r
   // review 2026-10-07). Telemetry must not alter the call it observes.
   try {
     const slowMs = slowThresholdMs();
-    const status = response ? response.status : (err && err.response ? err.response.status : undefined);
+    // Defensive per-field reads: a rejected object whose getters throw still gets its
+    // one line per attempt (with the details marked unreadable) instead of none
+    // (Copilot on the port, round 4). Only the shape of what we read is trusted.
+    const UNREADABLE = Symbol('unreadable');
+    const safeRead = (obj, key) => { try { return obj == null ? undefined : obj[key]; } catch (e) { return UNREADABLE; } };
+    const rawCode = err ? safeRead(err, 'code') : undefined;
+    const rawMessage = err ? safeRead(err, 'message') : undefined;
+    const rawResponse = err ? safeRead(err, 'response') : undefined;
+    const rawStatus = response ? safeRead(response, 'status') : (rawResponse && rawResponse !== UNREADABLE ? safeRead(rawResponse, 'status') : undefined);
+    const unreadable = [rawCode, rawMessage, rawResponse, rawStatus].includes(UNREADABLE);
+    const status = Number.isFinite(rawStatus) ? rawStatus : undefined;
     const isFailure = Boolean(err) || Boolean(failed);
     let errorText;
     if (isFailure) {
-      const code = err
-        ? (typeof err.code === 'string' ? err.code : undefined)
-        : (Number.isFinite(status) ? `HTTP ${status}` : undefined);
-      const message = err ? (typeof err.message === 'string' ? err.message : String(err)) : undefined;
-      errorText = safeErrorText({ code, message });
+      if (unreadable) {
+        errorText = '<error details unreadable>';
+      } else {
+        const code = err
+          ? (typeof rawCode === 'string' ? rawCode : undefined)
+          : (status !== undefined ? `HTTP ${status}` : undefined);
+        const message = typeof rawMessage === 'string' ? rawMessage : undefined;
+        errorText = safeErrorText({ code, message });
+      }
     }
     const record = {
       fn: functionName,

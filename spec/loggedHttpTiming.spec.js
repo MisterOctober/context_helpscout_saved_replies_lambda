@@ -100,8 +100,9 @@ describe('loggedHttp per-call timing log', () => {
     expect(out).not.toContain('SecretPathToken');
     expect(out).not.toContain('apipass');
     expect(out).not.toContain('abcdefghijklmnopqrstuvwxyz0123');
-    expect(out).toContain('https://hooks.slack.com/<redacted>');
-    expect(out).toContain('https://api.x.test/v1/x');
+    expect(out).toContain('https://hooks.slack.com '); // scheme + host only
+    expect(out).toContain('https://api.x.test ');
+    expect(out).not.toContain('/v1/x');
     expect(out).toContain('Bearer [REDACTED]');
     // and through the live path (whichever redactor branch this copy runs):
     expect(_timing.safeErrorText('rejected https://hooks.slack.com/actions/T1/B2/SecretPathToken')).not.toContain('SecretPathToken');
@@ -185,8 +186,8 @@ describe('loggedHttp per-call timing log', () => {
   it('compact JSON with two URLs in one token, and colon-delimited credentials, are scrubbed', () => {
     const out = _timing.scrubErrorText('rejected {"url":"https://api.x.test/v1","next":"https://hooks.slack.com/actions/T/B/SecretPathToken"} X-API-Key: SUPERSECRET1, api_key: SUPERSECRET2 Authorization: Bearer SUPERSECRET4');
     for (const s of ['SecretPathToken', 'SUPERSECRET1', 'SUPERSECRET2', 'SUPERSECRET4']) expect(out).not.toContain(s);
-    expect(out).toContain('https://api.x.test/v1');
-    expect(out).toContain('https://hooks.slack.com/<redacted>');
+    expect(out.startsWith('rejected {"url":"https://api.x.test X-API-Key: [REDACTED]')).toBe(true); // token → first URL's scheme+host only
+    expect(out).not.toContain('hooks.slack.com/actions');
     expect(out).toContain('X-API-Key: [REDACTED]');
     expect(out).toContain('Authorization: Bearer [REDACTED]');
   });
@@ -204,7 +205,18 @@ describe('loggedHttp per-call timing log', () => {
     const adapter = async () => { calls += 1; throw evil; };
     await expectAsync(loggedHttp({ method: 'get', url: 'https://example.test/x', adapter }, { functionName: 'spec', maxTries: 2, retryInterval: 0, slackChannel: null })).toBeRejected();
     expect(calls).toBe(2);
-    // Direct: logTiming with the hostile object neither throws nor emits a line (the guard swallows).
+    // Direct: logTiming with the hostile object neither throws nor drops its line — details marked unreadable.
+    warnSpy.calls.reset();
     expect(() => _timing.logTiming({ functionName: 'spec', method: 'get', url: 'https://example.test/x', attempt: 1, maxTries: 1, durationMs: 1, err: evil })).not.toThrow();
+    expect(timingLines(warnSpy).length).toBe(1);
+    expect(parseLine(timingLines(warnSpy)[0]).error).toBe('<error details unreadable>');
+  });
+
+  it('URL path suffixes after `;` or `,` on a capability host, quoted JSON keys with unquoted values, and escaped quotes inside quoted values are all masked', () => {
+    const out = _timing.scrubErrorText('rejected https://hooks.slack.com/services/T,B/SecretSuffix1 and https://hooks.slack.com/actions/T/B/Prefix;SecretSuffix2 {"api_key":123456} password: "prefix\\"SecretSuffix3" done');
+    for (const s of ['SecretSuffix1', 'SecretSuffix2', '123456', 'SecretSuffix3']) expect(out).not.toContain(s);
+    expect(out).toContain('https://hooks.slack.com and https://hooks.slack.com ');
+    expect(out).toContain('api_key: [REDACTED]');
+    expect(out).toContain('password: [REDACTED] done');
   });
 });
